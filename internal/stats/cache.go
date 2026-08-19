@@ -37,6 +37,9 @@ func (c *Cache) Get(accountID string) AccountStats {
 
 // Record folds one completed call into an account's running totals.
 func (c *Cache) Record(accountID string, durationSec int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	s, ok := c.m[accountID]
 	if !ok {
 		s = &AccountStats{}
@@ -44,4 +47,12 @@ func (c *Cache) Record(accountID string, durationSec int) {
 	}
 	s.CallCount++
 	s.TotalDurationSec += int64(durationSec)
+}
+
+// Seed overwrites an account's totals. Used to hydrate from Postgres on boot.
+func (c *Cache) Seed(accountID string, st AccountStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := st
+	c.m[accountID] = &cp
 }

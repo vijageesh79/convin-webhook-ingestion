@@ -50,3 +50,12 @@ func TestCacheRecordIsSafeConcurrently(t *testing.T) {
 		t.Fatalf("got %+v, want CallCount=%d TotalDurationSec=%d", got, n, n)
 	}
 }
+
+func TestCacheSeedHydratesTotals(t *testing.T) {
+	c := stats.NewCache()
+	c.Seed("acc_1", stats.AccountStats{CallCount: 4, TotalDurationSec: 90})
+	got := c.Get("acc_1")
+	if got.CallCount != 4 || got.TotalDurationSec != 90 {
+		t.Fatalf("got %+v, want CallCount=4 TotalDurationSec=90", got)
+	}
+}

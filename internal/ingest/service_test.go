@@ -2,6 +2,7 @@ package ingest_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -153,6 +154,53 @@ func TestRecordingIsMarkedProcessedAfterAccept(t *testing.T) {
 	}
 
 	waitRecordingProcessed(t, st, callID)
+}
+
+func TestPendingRecordingResumesAfterRestart(t *testing.T) {
+	st := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10,
+		RecordingURL: "https://example.com/a.wav", Payload: []byte(`{}`),
+	}
+	if err := st.UpsertCall(ctx, evt); err != nil {
+		t.Fatalf("UpsertCall: %v", err)
+	}
+
+	// A new process hydrates pending work from Postgres on Start.
+	_, _ = testutil.NewServer(t)
+	waitRecordingProcessed(t, st, callID)
+}
+
+func TestStatsHydrateFromDurableTotals(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	restarted, _ := testutil.NewServer(t)
+	resp, err := http.Get(restarted.URL + "/accounts/" + accountID + "/stats")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var got struct {
+		CallCount        int64 `json:"call_count"`
+		TotalDurationSec int64 `json:"total_duration_sec"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 143 {
+		t.Fatalf("after restart got %+v, want CallCount=1 TotalDurationSec=143", got)
+	}
 }
 
 func waitRecordingProcessed(t *testing.T, st *store.Store, callID string) {

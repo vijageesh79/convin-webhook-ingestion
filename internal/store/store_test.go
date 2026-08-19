@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/store"
@@ -84,5 +86,82 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 	}
 	if !processed {
 		t.Fatal("expected recording_processed to be true")
+	}
+}
+
+func TestApplyDeliveryIgnoresDuplicateEventID(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
+	}
+
+	inserted, err := s.ApplyDelivery(ctx, evt)
+	if err != nil {
+		t.Fatalf("first ApplyDelivery: %v", err)
+	}
+	if !inserted {
+		t.Fatal("first delivery should insert")
+	}
+
+	inserted, err = s.ApplyDelivery(ctx, evt)
+	if err != nil {
+		t.Fatalf("second ApplyDelivery: %v", err)
+	}
+	if inserted {
+		t.Fatal("duplicate event_id should not insert")
+	}
+
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 10 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=10", got)
+	}
+}
+
+func TestApplyDeliveryConcurrentDuplicate(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	var inserted atomic.Int32
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			ok, err := s.ApplyDelivery(ctx, evt)
+			if err != nil {
+				t.Errorf("ApplyDelivery: %v", err)
+				return
+			}
+			if ok {
+				inserted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := inserted.Load(); got != 1 {
+		t.Fatalf("inserted %d deliveries, want 1", got)
+	}
+
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 10 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=10", got)
 	}
 }

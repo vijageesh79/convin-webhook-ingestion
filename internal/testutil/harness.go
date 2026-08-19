@@ -54,6 +54,13 @@ func NewStore(t *testing.T) *store.Store {
 		t.Fatalf("connect to postgres (is `docker compose up` running?): %v", err)
 	}
 	t.Cleanup(s.Close)
+
+	// Tests (and ON CONFLICT) need the unique event_id index even if this
+	// Postgres volume was created before 002_event_id_unique.sql existed.
+	if _, err := s.Pool().Exec(context.Background(),
+		`CREATE UNIQUE INDEX IF NOT EXISTS events_event_id_key ON events (event_id)`); err != nil {
+		t.Fatalf("ensure unique event_id: %v", err)
+	}
 	return s
 }
 
@@ -73,8 +80,14 @@ func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := ingest.New(s, stats.NewCache(), rdb, log)
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("start service: %v", err)
+	}
 
 	srv := httptest.NewServer(httpapi.NewRouter(svc, log))
-	t.Cleanup(srv.Close)
+	t.Cleanup(func() {
+		srv.Close()
+		_ = svc.Shutdown(context.Background())
+	})
 	return srv, s
 }

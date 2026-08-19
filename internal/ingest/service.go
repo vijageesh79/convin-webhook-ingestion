@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,11 +23,52 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+
+	wg sync.WaitGroup
 }
 
 // New builds a Service.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
 	return &Service{store: s, cache: c, rdb: rdb, log: log}
+}
+
+// Start warms the in-memory stats cache from Postgres and resumes recording
+// work that was still pending when the previous process exited.
+func (s *Service) Start(ctx context.Context) error {
+	totals, err := s.store.AllAccountStats(ctx)
+	if err != nil {
+		return err
+	}
+	for accountID, st := range totals {
+		s.cache.Seed(accountID, stats.AccountStats{
+			CallCount:        st.CallCount,
+			TotalDurationSec: st.TotalDurationSec,
+		})
+	}
+
+	pending, err := s.store.UnprocessedRecordings(ctx)
+	if err != nil {
+		return err
+	}
+	for _, rec := range pending {
+		s.enqueueRecording(rec)
+	}
+	return nil
+}
+
+// Shutdown waits for in-flight recording work to finish, or until ctx ends.
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Stats returns the cached totals for an account.
@@ -37,15 +79,6 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,27 +94,36 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.ApplyDelivery(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		s.enqueueRecording(rec)
 	}
 
 	return nil
+}
+
+func (s *Service) enqueueRecording(rec store.Event) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		// Detached from the HTTP request: r.Context() is cancelled as soon as
+		// we write 200, which is exactly when this work still needs to run.
+		if err := s.processRecording(context.Background(), rec); err != nil {
+			s.log.Error("process recording failed", "call_id", rec.CallID, "err", err)
+		}
+	}()
 }
 
 // processRecording downloads and transcodes the call recording, then marks
