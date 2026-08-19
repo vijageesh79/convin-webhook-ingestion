@@ -49,7 +49,22 @@ func (c *Cache) Record(accountID string, durationSec int) {
 	s.TotalDurationSec += int64(durationSec)
 }
 
-// Seed overwrites an account's totals. Used to hydrate from Postgres on boot.
+// UpdateDuration adjusts the total duration for an existing account's stats
+// by a delta value (e.g. difference between old and new call duration),
+// without incrementing the call count.
+func (c *Cache) UpdateDuration(accountID string, durationDiffSec int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	s, ok := c.m[accountID]
+	if !ok {
+		s = &AccountStats{}
+		c.m[accountID] = s
+	}
+	s.TotalDurationSec += int64(durationDiffSec)
+}
+
+// Seed copies Postgres totals into the cache after a restart.
 func (c *Cache) Seed(accountID string, st AccountStats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
