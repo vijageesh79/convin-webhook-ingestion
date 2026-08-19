@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/convin/webhook-ingest/internal/store"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -81,4 +84,89 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
 	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 143 {
+		t.Fatalf("stats %+v, want CallCount=1 TotalDurationSec=143", got)
+	}
+}
+
+func TestConcurrentDuplicateDeliveryIsIdempotent(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+	body := eventJSON(eventID, callID, accountID)
+
+	const n = 25
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(srv.URL+"/webhooks/calls", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Errorf("post: %v", err)
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			codes[i] = resp.StatusCode
+		}()
+	}
+	wg.Wait()
+
+	for i, code := range codes {
+		if code != http.StatusOK {
+			t.Errorf("delivery %d: got %d, want 200", i, code)
+		}
+	}
+
+	var events int
+	row := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&events); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("stored %d copies of %s, want 1", events, eventID)
+	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 143 {
+		t.Fatalf("stats %+v, want CallCount=1 TotalDurationSec=143", got)
+	}
+}
+
+func TestRecordingIsMarkedProcessedAfterAccept(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	waitRecordingProcessed(t, st, callID)
+}
+
+func waitRecordingProcessed(t *testing.T, st *store.Store, callID string) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var processed bool
+		err := st.Pool().QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID).Scan(&processed)
+		if err == nil && processed {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("recording for %s was not marked processed", callID)
 }
