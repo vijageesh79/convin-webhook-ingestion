@@ -170,7 +170,7 @@ func TestPendingRecordingResumesAfterRestart(t *testing.T) {
 		t.Fatalf("UpsertCall: %v", err)
 	}
 
-	// A new process hydrates pending work from Postgres on Start.
+	// Pretend we restarted: Start should pick this call up.
 	_, _ = testutil.NewServer(t)
 	waitRecordingProcessed(t, st, callID)
 }
@@ -203,6 +203,36 @@ func TestStatsHydrateFromDurableTotals(t *testing.T) {
 	}
 }
 
+func TestAccountStatsEndpointAfterIngest(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("redelivery: got %d, want 200", resp.StatusCode)
+	}
+
+	resp, err := http.Get(srv.URL + "/accounts/" + accountID + "/stats")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var got struct {
+		CallCount        int64 `json:"call_count"`
+		TotalDurationSec int64 `json:"total_duration_sec"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 143 {
+		t.Fatalf("endpoint got %+v, want CallCount=1 TotalDurationSec=143", got)
+	}
+}
+
 func waitRecordingProcessed(t *testing.T, st *store.Store, callID string) {
 	t.Helper()
 	ctx := context.Background()
@@ -217,4 +247,116 @@ func waitRecordingProcessed(t *testing.T, st *store.Store, callID string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("recording for %s was not marked processed", callID)
+}
+
+func TestCallStatsDeduplicatedByCallID(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	// 1. Send first event for the call
+	body1 := fmt.Sprintf(`{
+	  "event_id":      %q,
+	  "call_id":       %q,
+	  "account_id":    %q,
+	  "status":        "completed",
+	  "duration_sec":  10,
+	  "recording_url": "https://recordings.example.com/r.wav",
+	  "occurred_at":   "2026-08-13T09:12:00Z"
+	}`, eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body1); resp.StatusCode != http.StatusOK {
+		t.Fatalf("first event: got %d, want 200", resp.StatusCode)
+	}
+
+	// 2. Send second event for the SAME call but with different event_id and duration
+	body2 := fmt.Sprintf(`{
+	  "event_id":      %q,
+	  "call_id":       %q,
+	  "account_id":    %q,
+	  "status":        "completed",
+	  "duration_sec":  15,
+	  "recording_url": "https://recordings.example.com/r.wav",
+	  "occurred_at":   "2026-08-13T09:13:00Z"
+	}`, eventID+"_new", callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body2); resp.StatusCode != http.StatusOK {
+		t.Fatalf("second event: got %d, want 200", resp.StatusCode)
+	}
+
+	// Verify duration in calls table is updated to 15
+	var dur int
+	err := st.Pool().QueryRow(ctx, `SELECT duration_sec FROM calls WHERE call_id = $1`, callID).Scan(&dur)
+	if err != nil {
+		t.Fatalf("query calls: %v", err)
+	}
+	if dur != 15 {
+		t.Fatalf("got duration %d, want 15", dur)
+	}
+
+	// Verify stats table has only 1 call and 15 seconds duration (no double count!)
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 15 {
+		t.Fatalf("database stats: got %+v, want CallCount=1 TotalDurationSec=15", got)
+	}
+
+	// Verify cache/endpoint has same stats
+	resp, err := http.Get(srv.URL + "/accounts/" + accountID + "/stats")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var gotCache struct {
+		CallCount        int64 `json:"call_count"`
+		TotalDurationSec int64 `json:"total_duration_sec"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&gotCache); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if gotCache.CallCount != 1 || gotCache.TotalDurationSec != 15 {
+		t.Fatalf("cache stats: got %+v, want CallCount=1 TotalDurationSec=15", gotCache)
+	}
+}
+
+func TestRecordingRetriedOnDuplicateWebhookIfUnprocessed(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	// 1. Manually insert the event and call as if the first attempt committed but crashed before recording was enqueued/processed
+	payload := []byte(`{}`)
+	_, err := st.Pool().Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)`,
+		eventID, callID, accountID, payload)
+	if err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+
+	_, err = st.Pool().Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, recording_processed, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, FALSE, now())`,
+		callID, accountID, "completed", 10, "https://example.com/r.wav")
+	if err != nil {
+		t.Fatalf("insert call: %v", err)
+	}
+
+	// 2. Post the webhook again (duplicate retry). Since recording_processed is FALSE, it should trigger recording processing.
+	body := fmt.Sprintf(`{
+	  "event_id":      %q,
+	  "call_id":       %q,
+	  "account_id":    %q,
+	  "status":        "completed",
+	  "duration_sec":  10,
+	  "recording_url": "https://example.com/r.wav",
+	  "occurred_at":   "2026-08-13T09:12:00Z"
+	}`, eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("post duplicate: got %d, want 200", resp.StatusCode)
+	}
+
+	// 3. Verify it gets processed successfully on the retry
+	waitRecordingProcessed(t, st, callID)
 }

@@ -24,16 +24,24 @@ type Service struct {
 	rdb   *redis.Client
 	log   *slog.Logger
 
-	wg sync.WaitGroup
+	wg  sync.WaitGroup
+	sem chan struct{}
 }
 
-// New builds a Service.
+// New builds a Service. rdb is connected by main and used for Redis distributed
+// locking during recording processing.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
-	return &Service{store: s, cache: c, rdb: rdb, log: log}
+	return &Service{
+		store: s,
+		cache: c,
+		rdb:   rdb,
+		log:   log,
+		sem:   make(chan struct{}, 5), // limits concurrent recording work to prevent DB connection starvation
+	}
 }
 
-// Start warms the in-memory stats cache from Postgres and resumes recording
-// work that was still pending when the previous process exited.
+// Start reloads stats from Postgres and finishes recordings that were
+// still pending when we last exited.
 func (s *Service) Start(ctx context.Context) error {
 	totals, err := s.store.AllAccountStats(ctx)
 	if err != nil {
@@ -95,19 +103,24 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		Payload:      payload,
 	}
 
-	inserted, err := s.store.ApplyDelivery(ctx, rec)
+	inserted, isNewCall, oldDuration, isProcessed, err := s.store.ApplyDelivery(ctx, rec)
 	if err != nil {
 		return err
 	}
-	if !inserted {
+
+	if inserted {
+		if isNewCall {
+			s.cache.Record(rec.AccountID, rec.DurationSec)
+		} else {
+			s.cache.UpdateDuration(rec.AccountID, rec.DurationSec - oldDuration)
+		}
+	} else {
 		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
 	}
 
-	s.cache.Record(rec.AccountID, rec.DurationSec)
-
-	// Recordings are slow to fetch, so that part does not block the provider.
-	if rec.RecordingURL != "" {
+	// Even if this is a duplicate webhook delivery, if the recording has not been marked
+	// processed yet, we attempt to process it again (safe retry).
+	if rec.RecordingURL != "" && !isProcessed {
 		s.enqueueRecording(rec)
 	}
 
@@ -118,8 +131,27 @@ func (s *Service) enqueueRecording(rec store.Event) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		// Detached from the HTTP request: r.Context() is cancelled as soon as
-		// we write 200, which is exactly when this work still needs to run.
+
+		// Acquire semaphore slot before proceeding
+		s.sem <- struct{}{}
+		defer func() { <-s.sem }()
+
+		// Acquire Redis distributed lock for this call_id to prevent concurrent processing
+		lockKey := "lock:recording:" + rec.CallID
+		ok, err := s.rdb.SetNX(context.Background(), lockKey, "1", 1*time.Minute).Result()
+		if err != nil {
+			s.log.Error("redis lock failed", "call_id", rec.CallID, "err", err)
+			return
+		}
+		if !ok {
+			s.log.Info("recording processing already in progress", "call_id", rec.CallID)
+			return
+		}
+		defer func() {
+			_, _ = s.rdb.Del(context.Background(), lockKey).Result()
+		}()
+
+		// r.Context() is already cancelled by the time we return 200.
 		if err := s.processRecording(context.Background(), rec); err != nil {
 			s.log.Error("process recording failed", "call_id", rec.CallID, "err", err)
 		}
