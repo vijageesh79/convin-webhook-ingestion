@@ -99,7 +99,7 @@ func TestApplyDeliveryIgnoresDuplicateEventID(t *testing.T) {
 		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
 	}
 
-	inserted, err := s.ApplyDelivery(ctx, evt)
+	inserted, _, _, _, err := s.ApplyDelivery(ctx, evt)
 	if err != nil {
 		t.Fatalf("first ApplyDelivery: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestApplyDeliveryIgnoresDuplicateEventID(t *testing.T) {
 		t.Fatal("first delivery should insert")
 	}
 
-	inserted, err = s.ApplyDelivery(ctx, evt)
+	inserted, _, _, _, err = s.ApplyDelivery(ctx, evt)
 	if err != nil {
 		t.Fatalf("second ApplyDelivery: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestApplyDeliveryConcurrentDuplicate(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			ok, err := s.ApplyDelivery(ctx, evt)
+			ok, _, _, _, err := s.ApplyDelivery(ctx, evt)
 			if err != nil {
 				t.Errorf("ApplyDelivery: %v", err)
 				return

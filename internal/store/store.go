@@ -103,13 +103,12 @@ func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error
 	return err
 }
 
-// ApplyDelivery persists a webhook and its side effects in one transaction.
-// inserted is false when event_id was already stored; in that case no call
-// row is written and account_stats are not incremented.
-func (s *Store) ApplyDelivery(ctx context.Context, e Event) (inserted bool, err error) {
+// ApplyDelivery writes the event, call, and stats in one transaction.
+// inserted=false means we already had this event_id — don't count it again.
+func (s *Store) ApplyDelivery(ctx context.Context, e Event) (inserted bool, isNewCall bool, oldDuration int, isProcessed bool, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, err
+		return false, false, 0, false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -119,13 +118,35 @@ func (s *Store) ApplyDelivery(ctx context.Context, e Event) (inserted bool, err 
 		 ON CONFLICT (event_id) DO NOTHING`,
 		e.EventID, e.CallID, e.AccountID, e.Payload)
 	if err != nil {
-		return false, err
+		return false, false, 0, false, err
 	}
 	if tag.RowsAffected() == 0 {
-		if err := tx.Commit(ctx); err != nil {
-			return false, err
+		var processed bool
+		err = tx.QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, e.CallID).Scan(&processed)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, false, 0, false, nil
+			}
+			return false, false, 0, false, err
 		}
-		return false, nil
+		if err := tx.Commit(ctx); err != nil {
+			return false, false, 0, false, err
+		}
+		return false, false, 0, processed, nil
+	}
+
+	var oldDur int
+	var processed bool
+	var callExists bool
+	err = tx.QueryRow(ctx,
+		`SELECT duration_sec, recording_processed FROM calls WHERE call_id = $1`, e.CallID).Scan(&oldDur, &processed)
+	if err == nil {
+		callExists = true
+	} else if errors.Is(err, pgx.ErrNoRows) {
+		callExists = false
+	} else {
+		return false, false, 0, false, err
 	}
 
 	_, err = tx.Exec(ctx,
@@ -138,28 +159,36 @@ func (s *Store) ApplyDelivery(ctx context.Context, e Event) (inserted bool, err 
 		     updated_at    = now()`,
 		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
 	if err != nil {
-		return false, err
+		return false, false, 0, false, err
 	}
 
-	_, err = tx.Exec(ctx,
-		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
-		 VALUES ($1, 1, $2)
-		 ON CONFLICT (account_id) DO UPDATE SET
-		     call_count         = account_stats.call_count + 1,
-		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
-		e.AccountID, e.DurationSec)
+	if callExists {
+		_, err = tx.Exec(ctx,
+			`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+			 VALUES ($1, 0, $2)
+			 ON CONFLICT (account_id) DO UPDATE SET
+			     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+			e.AccountID, int64(e.DurationSec - oldDur))
+	} else {
+		_, err = tx.Exec(ctx,
+			`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+			 VALUES ($1, 1, $2)
+			 ON CONFLICT (account_id) DO UPDATE SET
+			     call_count         = account_stats.call_count + 1,
+			     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+			e.AccountID, int64(e.DurationSec))
+	}
 	if err != nil {
-		return false, err
+		return false, false, 0, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return false, err
+		return false, false, 0, false, err
 	}
-	return true, nil
+	return true, !callExists, oldDur, processed, nil
 }
 
-// UnprocessedRecordings returns calls that still need recording work.
-// Used on startup so a deploy does not drop in-flight processing.
+// UnprocessedRecordings is the work we still owe after a restart.
 func (s *Store) UnprocessedRecordings(ctx context.Context) ([]Event, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT call_id, account_id, status, duration_sec, COALESCE(recording_url, '')
@@ -183,7 +212,7 @@ func (s *Store) UnprocessedRecordings(ctx context.Context) ([]Event, error) {
 	return out, rows.Err()
 }
 
-// AllAccountStats returns every durable aggregate, for warming the in-memory cache.
+// AllAccountStats is used to fill the in-memory cache on boot.
 func (s *Store) AllAccountStats(ctx context.Context) (map[string]Stats, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT account_id, call_count, total_duration_sec FROM account_stats`)
